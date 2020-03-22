@@ -1,0 +1,500 @@
+CREATE PROCEDURE [SkyNet].[MigrateDataByDataSource]
+(
+    @SourceDatabase VARCHAR(200),
+    @TargetDatabase VARCHAR(200),
+    @SourceSchema   VARCHAR(50)   = NULL,
+    @TargetSchema   VARCHAR(50)   = NULL,
+    @DataSource     VARCHAR(100),
+    @TransactionID  INT           = NULL,
+    @StartNewTran   BIT           = NULL,
+    @IncidentOutput VARCHAR(2000) = NULL OUTPUT,
+    @ThisProgram    VARCHAR(1000) = NULL OUTPUT,
+    @Success        BIT           = 1 OUTPUT
+)
+AS
+    DECLARE @DatabaseName   VARCHAR(20)  = @TargetDatabase,
+            @LogID          INT,
+            @SignUpTypeID   INT          = 1, --Default
+            @SourceFileName VARCHAR(200) = 'Migrating data from ' + @SourceDatabase + ' to ' + @TargetDatabase
+                                           + ' for datasource ' + @DataSource;
+    BEGIN
+
+        BEGIN TRY
+
+            SELECT @ThisProgram = 'MigrateData for DataSource ' + @DataSource;
+
+            IF @StartNewTran IS NULL
+                SET @StartNewTran = 1;
+
+            EXECUTE SkyNet.syn_Log_Begin_Transaction @ThisProgram = @ThisProgram,
+                                                     @DatabaseName = @DatabaseName,
+                                                     @SourceFileName = @SourceFileName,
+                                                     @StartNewTran = @StartNewTran OUTPUT,
+                                                     @TransactionID = @TransactionID OUTPUT;
+
+            IF @TargetSchema IS NULL
+           AND @SourceSchema IS NULL
+                BEGIN
+                    RAISERROR('Either source or target schema must be provided!', 14, 1);
+                END;
+
+            IF @TargetSchema IS NULL
+                SET @TargetSchema = @SourceSchema;
+
+            IF @SourceSchema IS NULL
+                SET @SourceSchema = @TargetSchema;
+
+            -- Prevent that the production database gets affected.
+            IF (LOWER(@TargetDatabase)NOT LIKE LOWER('%dev'))
+           AND (LOWER(@TargetDatabase)NOT LIKE LOWER('%test'))
+           AND (LOWER(@TargetDatabase) != LOWER('DataMart'))
+           AND (LOWER(@@SERVERNAME) != LOWER('HMMSQL-DEV'))
+           AND (LOWER(@@SERVERNAME) != LOWER('SQLSRV-UATWH'))
+           AND (LOWER(@@SERVERNAME) != LOWER('SQLSRV-UATDM'))
+           AND (LOWER(@@SERVERNAME) != LOWER('HMMSQL-STAGE'))
+                BEGIN
+                    RAISERROR('Can''t update a production environment!', 14, 1);
+                END;
+
+            PRINT 'Schema effected: ' + @TargetSchema;
+
+            --Creating a temporary table that will contains all the tables that are going to be affected by this statement.
+            CREATE TABLE #tempDisposableTable
+            (
+                id               INT IDENTITY(1, 1) PRIMARY KEY,
+                tableCatalog     VARCHAR(100),
+                tableSchema      VARCHAR(100),
+                tableName        VARCHAR(100),
+                columnsInTable   VARCHAR(MAX),
+                mergeOnStatement VARCHAR(MAX),
+                updateStatement  VARCHAR(MAX),
+                uniqueStatement  VARCHAR(MAX), -- Not being used for now but keeping this logic for future reference
+                dependencyLevel  INT,
+                sourceSchema     VARCHAR(100),
+                maxLastUpdated   DATETIME
+            );
+
+            IF @StartNewTran = 1
+                BEGIN TRANSACTION;
+
+            EXECUTE SkyNet.syn_Insert_Audit_Log @TransactionID = @TransactionID,
+                                                @LogSourceOfCode = @ThisProgram,
+                                                @StatusID = 1,
+                                                @LogID = @LogID OUTPUT;
+
+            DECLARE @tempString VARCHAR(MAX);
+            DECLARE @statementsString VARCHAR(MAX);
+            DECLARE @return VARCHAR(MAX); --used in merge to generate the columns comma separated.
+            DECLARE @i INT = 1;
+            DECLARE @i2 INT = 1;
+            DECLARE @i3 INT = 1;
+            DECLARE @i4 INT = 1;
+            DECLARE @i5 INT = 1;
+            DECLARE @mergeOnStr VARCHAR(MAX); --used in merge statement to generate the join condition columns
+            DECLARE @updateStr VARCHAR(MAX); --used in merge statement to generate the update columns
+            DECLARE @uniqueStr VARCHAR(MAX); --used in merge statement to generate the unique constraint columns
+            SET @uniqueStr = ''; -- set to empty string or else first record in tempDisposableTable will have a null value which eliminates it
+
+            -- Create a table variable that will contain all the tables that we need to loop through and retrieve the column names from.
+            DECLARE @tableTable TABLE
+            (
+                id              INT IDENTITY(1, 1) PRIMARY KEY,
+                tableCatalog    VARCHAR(100),
+                tableSchema     VARCHAR(100),
+                tableName       VARCHAR(255),
+                dependencyLevel INT
+            );
+
+            -- Execute [SkyNet].[Select_TableDependencyLevel]  precedure to get the foreign key dependencies for each table
+            INSERT INTO @tableTable (tableCatalog,
+                                     tableSchema,
+                                     tableName,
+                                     dependencyLevel)
+            EXECUTE [SkyNet].[Select_TableDependencyLevel] @Schema = @TargetSchema,
+                                                           @DataSource = @DataSource,
+                                                           @TargetDatabase = @TargetDatabase,
+                                                           @TransactionID = @TransactionID,
+                                                           @Success = @Success;
+
+            --will contain all columns
+            DECLARE @columnTable TABLE
+            (
+                id         INT IDENTITY(1, 1) PRIMARY KEY,
+                columnName VARCHAR(255)
+            );
+
+            --will contain all columns that are primary keys
+            DECLARE @pkColumnTable TABLE
+            (
+                id         INT IDENTITY(1, 1) PRIMARY KEY,
+                columnName VARCHAR(255)
+            );
+
+            --will contain all columns that can be updated in the merge statement
+            DECLARE @updateColumnTable TABLE
+            (
+                id         INT IDENTITY(1, 1) PRIMARY KEY,
+                columnName VARCHAR(255)
+            );
+
+            --will contain all columns that have unique constraints
+            DECLARE @ucColumnTable TABLE
+            (
+                id         INT IDENTITY(1, 1) PRIMARY KEY,
+                columnName VARCHAR(255)
+            );
+
+            --fill @tempTablename with table for each table present in the @tableTable and generate for each table the columns in 
+            --the @columnTable, @pkColumnTable & @updateColumnTable.
+            WHILE EXISTS (SELECT * FROM @tableTable WHERE id = @i)
+                BEGIN
+
+                    DECLARE @tempTableName   VARCHAR(100),
+                            @tempSchemaName  VARCHAR(100),
+                            @dependencyLevel INT;
+
+                    SELECT @tempTableName   = tableName,
+                           @tempSchemaName  = tableSchema,
+                           @dependencyLevel = dependencyLevel
+                    FROM @tableTable
+                    WHERE id = @i;
+
+                    --this statement will return all columns for the table that is stored in the @tempTableName variable.
+                    SET @statementsString = 'SELECT ''source.'' + COLUMN_NAME FROM ' + @TargetDatabase
+                                            + '.INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA =''' + @tempSchemaName
+                                            + ''' AND TABLE_NAME =''' + @tempTableName + ''' AND TABLE_CATALOG= '''
+                                            + @TargetDatabase + ''';';
+
+                    --insert all columns in to temporary table variable
+                    INSERT INTO @columnTable (columnName)
+                    EXEC (@statementsString);
+
+                    --while columns exist in @columnTable generate string column1, column2, column3 etc.
+                    WHILE EXISTS (SELECT columnName FROM @columnTable WHERE id = @i2)
+                        BEGIN
+
+                            SELECT @tempString = '' + columnName + ', '
+                            FROM @columnTable
+                            WHERE id = @i2;
+
+                            SET @return = CONCAT(@return, @tempString);
+                            SET @i2 = @i2 + 1;
+
+                        END;
+                    --remove last , character
+                    SET @return = LEFT(@return, LEN(@return) - 1);
+
+                    DELETE FROM @columnTable;
+
+                    --this statement will return all primary key columns for the table that is stored in the @tempTableName variable.
+                    SET @statementsString = 'SELECT t1.COLUMN_NAME FROM ' + @TargetDatabase
+                                            + '.INFORMATION_SCHEMA.KEY_COLUMN_USAGE AS t1 INNER JOIN '
+                                            + @TargetDatabase
+                                            + '.INFORMATION_SCHEMA.TABLE_CONSTRAINTS AS t2 ON t1.CONSTRAINT_NAME = t2.CONSTRAINT_NAME WHERE CONSTRAINT_TYPE = ''PRIMARY KEY'' AND t1.TABLE_SCHEMA ='''
+                                            + @tempSchemaName + ''' AND t2.TABLE_SCHEMA =''' + @tempSchemaName
+                                            + ''' AND t1.TABLE_NAME =''' + @tempTableName
+                                            + ''' AND t1.TABLE_CATALOG= ''' + @TargetDatabase + ''';';
+
+                    --insert all primary key columns in to temporary table variable @pkColumnTable
+                    INSERT INTO @pkColumnTable (columnName)
+                    EXEC (@statementsString);
+
+                    --while columns exist in @columnTable generate string [target.column1= source.column1 and target.column2= source.column2] etc.
+                    WHILE EXISTS (SELECT columnName FROM @pkColumnTable WHERE id = @i3)
+                        BEGIN
+
+                            SELECT @tempString = 'target.' + columnName + ' = source.' + columnName + ' and '
+                            FROM @pkColumnTable
+                            WHERE id = @i3;
+
+                            SET @mergeOnStr = CONCAT(@mergeOnStr, @tempString);
+                            SET @i3 = @i3 + 1;
+
+                        END;
+
+                    DELETE FROM @pkColumnTable;
+                    --remove last 'and' from string
+                    IF (LEN(@mergeOnStr) > 0)
+                        SET @mergeOnStr = '(' + LEFT(@mergeOnStr, LEN(@mergeOnStr) - 4) + ')';
+
+                    --this statement will return all columns that can be updated (no pk columns) for the table that is stored in the @tempTableName variable.
+                    SET @statementsString = 'SELECT COLUMN_NAME FROM ' + @TargetDatabase
+                                            + '.INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA =''' + @tempSchemaName
+                                            + ''' AND TABLE_NAME =''' + @tempTableName + ''' AND TABLE_CATALOG= '''
+                                            + @TargetDatabase
+                                            + ''' and COLUMN_NAME NOT IN (SELECT t1.COLUMN_NAME FROM '
+                                            + @TargetDatabase
+                                            + '.INFORMATION_SCHEMA.KEY_COLUMN_USAGE AS t1 INNER JOIN '
+                                            + @TargetDatabase
+                                            + '.INFORMATION_SCHEMA.TABLE_CONSTRAINTS AS t2 ON t1.CONSTRAINT_NAME = t2.CONSTRAINT_NAME WHERE CONSTRAINT_TYPE = ''PRIMARY KEY'' AND t1.TABLE_SCHEMA ='''
+                                            + @tempSchemaName + ''' AND t1.TABLE_NAME =''' + @tempTableName
+                                            + ''' AND t1.TABLE_CATALOG= ''' + @TargetDatabase + ''');';
+
+                    --insert updatable columns in temporary table
+                    INSERT INTO @updateColumnTable (columnName)
+                    EXEC (@statementsString);
+
+                    --while updatable columns exist in temporary table generate string [target.column1 = source.column1, target.column2 = source.column2] etc.
+                    WHILE EXISTS (SELECT columnName FROM @updateColumnTable WHERE id = @i4)
+                        BEGIN
+
+                            SELECT @tempString = 'target.' + columnName + ' = source.' + columnName + ','
+                            FROM @updateColumnTable
+                            WHERE id = @i4;
+
+                            SET @updateStr = CONCAT(@updateStr, @tempString);
+                            SET @i4 = @i4 + 1;
+
+                        END;
+
+                    DELETE FROM @updateColumnTable;
+
+                    --remove last ',' from string
+                    IF (LEN(@updateStr) > 0)
+                        SET @updateStr = LEFT(@updateStr, LEN(@updateStr) - 1);
+
+                    --insert all unique key columns in to temporary table variable @ucColumnTable.
+                    SET @statementsString = 'SELECT COLUMN_NAME FROM ' + @TargetDatabase
+                                            + '.information_schema.table_constraints TC JOIN ' + @TargetDatabase
+                                            + '.information_schema.constraint_column_usage CC ON TC.Constraint_Name = CC.Constraint_Name WHERE TC.constraint_type = ''Unique'' AND TC.TABLE_SCHEMA ='''
+                                            + @tempSchemaName + ''' AND CC.TABLE_SCHEMA =''' + @tempSchemaName
+                                            + ''' AND TC.TABLE_NAME =''' + @tempTableName
+                                            + ''' AND TC.TABLE_CATALOG= ''' + @TargetDatabase + ''''; --print @statementsString;
+
+                    --insert unique columns in temporary table
+                    INSERT INTO @ucColumnTable (columnName)
+                    EXEC (@statementsString);
+
+                    --while updatable columns exist in temporary table generate string [target.column1 = source.column1, target.column2 = source.column2] etc.
+                    WHILE EXISTS (SELECT columnName FROM @ucColumnTable WHERE id = @i5)
+                        BEGIN
+
+                            SELECT @tempString = 'target.' + columnName + ' = source.' + columnName + ' and '
+                            FROM @ucColumnTable
+                            WHERE id = @i5;
+
+                            SET @uniqueStr = CONCAT(@uniqueStr, @tempString);
+                            SET @i5 = @i5 + 1;
+
+                        END;
+
+                    DELETE FROM @updateColumnTable;
+
+                    --Get MAXLastUpdated value from table
+                    DECLARE @parm                   NVARCHAR(100),
+                            @tableMaxLastUpdated    DATETIME,
+                            @tableMaxLastUpdatedOut DATETIME,
+                            @cmd                    NVARCHAR(MAX);
+
+                    SELECT @parm = N'@tableMaxLastUpdated DATETIME OUTPUT';
+
+                    SET @cmd = N'SELECT @tableMaxLastUpdated= MAX(LastUpdated) FROM ' + @TargetDatabase + N'.'
+                               + @tempSchemaName + N'.' + @tempTableName;
+                    EXECUTE sp_executesql @cmd,
+                                          @parm,
+                                          @tableMaxLastUpdated = @tableMaxLastUpdatedOut OUTPUT;
+
+                    --remove last 'and' from string
+                    IF (LEN(@uniqueStr) > 0)
+                        SET @uniqueStr = LEFT(@uniqueStr, LEN(@uniqueStr) - 3);
+
+                    --enter record for table in tempDisposableTable (will be joined to later in the queries below(@statementsString) to retrieve correct columnnames.
+                    INSERT INTO #tempDisposableTable
+                    VALUES (@TargetDatabase,
+                            @tempSchemaName,
+                            @tempTableName,
+                            @return,
+                            @mergeOnStr,
+                            @updateStr,
+                            @uniqueStr,
+                            @dependencyLevel,
+                            @SourceSchema,
+                            ISNULL(@tableMaxLastUpdatedOut, '1900-01-01')); -- Setting to '1900-01-01' by default in case tables are empty. We then have to migrate everyting. 
+
+                    SET @return = '';
+                    SET @mergeOnStr = '';
+                    SET @updateStr = '';
+                    SET @uniqueStr = '';
+                    SET @i = @i + 1;
+
+                END;
+
+            DECLARE @statementString  VARCHAR(MAX),
+                    @statementString2 VARCHAR(MAX),
+                    @activeStatement  VARCHAR(MAX),
+                    @activeStatement2 VARCHAR(MAX);
+
+            DECLARE @tempStatementsTable TABLE
+            (
+                id              INT IDENTITY(1, 1) PRIMARY KEY,
+                sqlStatement    VARCHAR(MAX),
+                sqlStatement2   VARCHAR(MAX),
+                dependencyLevel INT
+            );
+
+            DECLARE @tempMergeStatements TABLE
+            (
+                sqlStatement    VARCHAR(MAX),
+                sqlStatement2   VARCHAR(MAX),
+                dependencyLevel INT
+            );
+
+            --Iterator is used for looping through all records in tempraryStatementsTable
+            DECLARE @iterator INT = 1;
+
+            --Trim ServerName if Exists
+            DECLARE @TempTableCatalog VARCHAR(100);
+
+            SET @TempTableCatalog = @TargetDatabase;
+
+            IF (CHARINDEX('.', @TempTableCatalog) > 0)
+                BEGIN
+                    SELECT @TempTableCatalog = RIGHT(@TempTableCatalog, LEN(@TempTableCatalog)
+                                                                        - CHARINDEX('.', @TempTableCatalog));
+                END;
+
+            --Delete records from target that are not in source anymore
+            SET @statementString = 'SELECT distinct ''delete source from ' + @TargetDatabase
+                                   + '.'' + QUOTENAME(s.name) + ''.'' + QUOTENAME(t.name) +'' source where not exists ( select * from '
+                                   + @SourceDatabase
+                                   + '.'' + QUOTENAME(td.sourceSchema) + ''.'' + QUOTENAME(t.name) +'' target where''+ td.mergeOnStatement +'' )'', td.dependencyLevel FROM '
+                                   + @TargetDatabase + '.sys.objects o join ' + @TargetDatabase
+                                   + '.sys.tables t on(o.parent_object_id = t.object_id) join ' + @TargetDatabase
+                                   + '.sys.schemas s on(o.schema_id = s.schema_id) inner join #tempDisposableTable td on (s.name = td.tableSchema and t.name = td.tableName) WHERE s.name IN ('''
+                                   + @TargetSchema + ''') AND s.name != ''sys'' ORDER BY td.dependencyLevel desc;';
+
+            --Insert delete statements into temprary table 'tempraryStatementsTable'
+            INSERT INTO @tempStatementsTable (sqlStatement,
+                                              dependencyLevel)
+            EXEC (@statementString);
+
+            --Tables With Identity Column
+            SET @statementString = 'SELECT ''SET IDENTITY_INSERT ' + @TargetDatabase
+                                   + '.''  + QUOTENAME(TABLE_SCHEMA) + ''.'' + QUOTENAME(TABLE_NAME) +'' ON;merge into '
+                                   + @TargetDatabase
+                                   + '.''  + QUOTENAME(TABLE_SCHEMA) + ''.'' + QUOTENAME(TABLE_NAME) +'' target using(select * from '
+                                   + @SourceDatabase
+                                   + '.''  + QUOTENAME(t.sourceSchema) + ''.'' + QUOTENAME(TABLE_NAME) +'' where CAST(LastUpdated as datetime) > CAST(''+  QUOTENAME(CONVERT(varchar,t.maxLastUpdated,21),'''''''') + '' as datetime)) source on ''+ t.mergeOnStatement +'' when matched then update set ''+t.updateStatement, '' when not matched then insert(''+ REPLACE( t.columnsInTable,''source.'','''') +'') values(''+t.columnsInTable+''); SET IDENTITY_INSERT '
+                                   + @TargetDatabase
+                                   + '.''  + QUOTENAME(TABLE_SCHEMA) + ''.'' + QUOTENAME(TABLE_NAME) +'' OFF;'', t.dependencyLevel FROM '
+                                   + @TargetDatabase
+                                   + '.INFORMATION_SCHEMA.TABLES st inner join #tempDisposableTable t on (st.TABLE_SCHEMA = t.tableSchema and st.TABLE_NAME = t.tableName) WHERE QUOTENAME(TABLE_SCHEMA) + ''.'' + QUOTENAME(TABLE_NAME) IN (SELECT QUOTENAME(s.name) +''.''+QUOTENAME(tab.name) as tableName FROM '
+                                   + @TargetDatabase + '.SYS.Tables tab join ' + @TargetDatabase
+                                   + '.SYS.schemas s on (tab.schema_id = s.schema_id) join ' + @TargetDatabase
+                                   + '.SYS.columns col on (tab.object_id = col.object_id) WHERE col.is_identity = 1 AND tab.type = ''U'' GROUP BY QUOTENAME(s.name) +''.''+QUOTENAME(tab.name)) AND  TABLE_TYPE = ''BASE TABLE'' AND TABLE_SCHEMA IN ('''
+                                   + @TargetSchema
+                                   + ''') AND TABLE_SCHEMA != ''sys'' AND TABLE_NAME != ''tempDisposableTable'' AND TABLE_CATALOG ='''
+                                   + @TempTableCatalog + ''';';
+            --SET @statementString2 = 'SELECT ''when not matched then insert(''+ REPLACE( t.columnsInTable,''source.'','''') +'') values(''+t.columnsInTable+''); SET IDENTITY_INSERT '+@TargetDatabase+'.''  + QUOTENAME(TABLE_SCHEMA) + ''.'' + QUOTENAME(TABLE_NAME) +'' OFF;'' FROM '+@TargetDatabase+'.INFORMATION_SCHEMA.TABLES st inner join #tempDisposableTable t on (st.TABLE_SCHEMA = t.tableSchema and st.TABLE_NAME = t.tableName) WHERE QUOTENAME(TABLE_SCHEMA) + ''.'' + QUOTENAME(TABLE_NAME) NOT IN (SELECT QUOTENAME(s.name) +''.''+QUOTENAME(tab.name) as tableName FROM '+ @TargetDatabase +'.SYS.Tables tab join '+ @TargetDatabase +'.SYS.schemas s on (tab.schema_id = s.schema_id) WHERE OBJECTPROPERTY(tab.object_id,''TableHasIdentity'') = 0 AND tab.type = ''U'' GROUP BY QUOTENAME(s.name) +''.''+QUOTENAME(tab.name)) AND  TABLE_TYPE = ''BASE TABLE'' AND TABLE_SCHEMA IN (''' + @TargetSchema+''') AND TABLE_SCHEMA != ''sys'' AND TABLE_NAME != ''tempDisposableTable'' AND TABLE_CATALOG =''' + @TempTableCatalog + ''';';
+            --print @statementString; 
+
+            --Insert 'Insert from source to target tables' Statements into temprary table 'tempraryStatementsTable'
+            INSERT INTO @tempMergeStatements (sqlStatement,
+                                              sqlStatement2,
+                                              dependencyLevel)
+            EXEC (@statementString);
+
+            --Tables without Identity Column
+            SET @statementString = 'SELECT ''merge into ' + @TargetDatabase
+                                   + '.''  + QUOTENAME(TABLE_SCHEMA) + ''.'' + QUOTENAME(TABLE_NAME) +'' target using(select * from '
+                                   + @SourceDatabase
+                                   + '.''  + QUOTENAME(t.sourceSchema) + ''.'' + QUOTENAME(TABLE_NAME) +'' where CAST(LastUpdated as datetime) > CAST(''+  QUOTENAME(CONVERT(varchar,t.maxLastUpdated,21),'''''''') + '' as datetime)) source on ''+ t.mergeOnStatement +'' when matched then update set ''+t.updateStatement +'' when not matched then insert(''+ REPLACE( t.columnsInTable,''source.'','''') +'') values(''+t.columnsInTable+'');'' ,t.dependencyLevel FROM '
+                                   + @TargetDatabase
+                                   + '.INFORMATION_SCHEMA.TABLES st inner join #tempDisposableTable t on (st.TABLE_SCHEMA = t.tableSchema and st.TABLE_NAME = t.tableName) WHERE QUOTENAME(TABLE_SCHEMA) + ''.'' + QUOTENAME(TABLE_NAME) NOT IN (SELECT QUOTENAME(s.name) +''.''+QUOTENAME(tab.name) as tableName FROM '
+                                   + @TargetDatabase + '.SYS.Tables tab join ' + @TargetDatabase
+                                   + '.SYS.schemas s on (tab.schema_id = s.schema_id) join ' + @TargetDatabase
+                                   + '.SYS.columns col on (tab.object_id = col.object_id) WHERE col.is_identity = 1 AND type = ''U'' GROUP BY QUOTENAME(s.name) +''.''+QUOTENAME(tab.name)) AND TABLE_TYPE = ''BASE TABLE'' AND TABLE_SCHEMA IN ('''
+                                   + @TargetSchema + ''') AND TABLE_SCHEMA != ''sys'' AND TABLE_CATALOG = '''
+                                   + @TempTableCatalog + ''';';
+
+            INSERT INTO @tempMergeStatements (sqlStatement,
+                                              dependencyLevel)
+            EXEC (@statementString);
+
+            INSERT INTO @tempStatementsTable (sqlStatement,
+                                              sqlStatement2,
+                                              dependencyLevel)
+                        SELECT sqlStatement,
+                               sqlStatement2,
+                               dependencyLevel
+                        FROM @tempMergeStatements
+                        ORDER BY dependencyLevel;
+
+            --Run all statements in temprary table 'temporaryStatementsTable'
+            WHILE EXISTS (SELECT sqlStatement FROM @tempStatementsTable WHERE id = @iterator)
+                BEGIN
+
+                    SELECT @activeStatement  = sqlStatement,
+                           @activeStatement2 = sqlStatement2
+                    FROM @tempStatementsTable
+                    WHERE id = @iterator;
+
+                    --PRINT(@activeStatement);
+                    --PRINT(@activeStatement2);
+                    IF (@activeStatement2 IS NULL)
+                        EXEC (@activeStatement);
+                    ELSE
+                        EXEC (@activeStatement + ' ' + @activeStatement2);
+
+                    SET @iterator = @iterator + 1;
+
+                END;
+
+            DROP TABLE #tempDisposableTable;
+
+            ----Jump to Catch Block if nested stored proc failed --> @Success <> 1
+            IF @Success <> 1
+                THROW 50000, @IncidentOutput, 1;
+            ELSE
+                BEGIN
+                    EXECUTE SkyNet.syn_Log_Commit_Transaction @TransactionID = @TransactionID,
+                                                              @LogID = @LogID,
+                                                              @NestLevel = @@NESTLEVEL;
+
+                    PRINT 'Execution of stored procedure was successful. ';
+
+                    IF @StartNewTran = 1
+                        COMMIT TRAN;
+                END;
+        END TRY
+        BEGIN CATCH
+            SET @Success = 0; --"Fail"
+            IF @IncidentOutput IS NULL
+                SELECT @IncidentOutput = 'Error Number ' + CAST(ERROR_NUMBER() AS VARCHAR(10)) + ' - '
+                                         + ERROR_MESSAGE(),
+                       @ThisProgram    = 'MigrateData for DataSource ' + @DataSource;
+
+            IF @@TRANCOUNT > 0
+           AND @StartNewTran = 1
+                BEGIN
+                    ROLLBACK TRANSACTION;
+
+                    --create log for the TransactionID
+                    EXECUTE SkyNet.Insert_Audit_Log @TransactionID = @TransactionID,
+                                                    @LogSourceOfCode = @ThisProgram,
+                                                    @StatusID = 3,
+                                                    @LogID = @LogID OUTPUT;
+
+                    --create Incident 
+                    EXECUTE SkyNet.Insert_Audit_Incident @LogID = @LogID,
+                                                         @SignUpTypeID = @SignUpTypeID,
+                                                         @IncidentOutput = @IncidentOutput,
+                                                         @IsIncident = 1, --Technical errors 
+                                                         @IsWarning = 0;  --Not Business rules violation
+
+                    --Update End DateTime of the log
+                    EXECUTE SkyNet.Update_Audit_Log_EndDate @LogID = @LogID,
+                                                            @StatusID = 3;
+                END;
+
+            IF @@NESTLEVEL <= 1
+                BEGIN
+                    --Update status of the transaction to 3 (rolled back)
+                    EXECUTE SkyNet.Update_Audit_Transaction_Status @TransactionID = @TransactionID,
+                                                                   @StatusID = 3;
+                END;
+
+            PRINT 'Execution of stored procedure was unsuccessful. Please check the error log. ';
+
+        END CATCH;
+    END;
